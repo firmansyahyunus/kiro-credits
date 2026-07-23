@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +56,37 @@ class ReleaseScanTests(unittest.TestCase):
 
             self.assertIn("GitHub classic token", labels)
             self.assertIn("GitHub fine-grained token", labels)
+
+    def test_unreadable_file_does_not_return_exception_details(self):
+        class UnreadablePath:
+            def read_bytes(self):
+                raise OSError("private path C:\\Users\\alice\\secret.txt")
+
+        self.assertEqual(
+            [("unreadable file", "file could not be read")],
+            release_scan.scan_text(UnreadablePath()),
+        )
+
+    def test_cli_does_not_echo_private_finding_details(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            private_value = "private-company.example"
+            private_filename = "customer-secret.txt"
+            (root / private_filename).write_text(private_value, encoding="utf-8")
+            original_root = release_scan.ROOT
+            output = io.StringIO()
+            try:
+                release_scan.ROOT = root
+                with contextlib.redirect_stdout(output):
+                    result = release_scan.main(["--forbid", private_value])
+            finally:
+                release_scan.ROOT = original_root
+
+            rendered = output.getvalue()
+            self.assertEqual(1, result)
+            self.assertNotIn(private_value, rendered)
+            self.assertNotIn(private_filename, rendered)
+            self.assertIn("release safety rule failed", rendered)
 
     def test_local_candidates_exclude_legacy_private_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

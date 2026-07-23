@@ -51,6 +51,8 @@ kcredits report month
 kcredits report all
 kcredits report all --project example-project
 kcredits report month --json
+kcredits report month --json --safe-share
+kcredits doctor --safe-share
 ```
 
 Jika menjalankan langsung dari source, ganti `kcredits` dengan
@@ -64,6 +66,9 @@ Jika menjalankan langsung dari source, ganti `kcredits` dengan
 - Isi prompt dan response tidak dimasukkan ke laporan.
 - Snapshot opsional hanya menulis ke `~/.kcredits/usage.csv`, kecuali lokasi
   diganti sendiri melalui `KCREDITS_DATA_DIR`.
+- Gunakan `--safe-share` atau `--redact-paths` sebelum menyalin output ke issue,
+  chat, screenshot, atau log. Opsi ini mengganti path lokal dengan label
+  sintetis.
 - Jangan upload session asli, archive CSV, atau screenshot yang masih
   memperlihatkan path pribadi ke GitHub issue.
 

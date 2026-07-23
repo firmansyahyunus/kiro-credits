@@ -140,8 +140,8 @@ def scan_text(path, forbidden_values=()):
     """Return findings for one UTF-8 text file; unexpected binaries are rejected."""
     try:
         raw = path.read_bytes()
-    except OSError as error:
-        return [("unreadable file", str(error))]
+    except OSError:
+        return [("unreadable file", "file could not be read")]
     if b"\0" in raw:
         return [("binary file", "binary files require a separate metadata and privacy review")]
     return scan_content(raw.decode("utf-8", errors="replace"), forbidden_values)
@@ -256,8 +256,10 @@ def main(argv=None):
         include_history=args.history,
     )
     print(f"kcredits public release scan: {mode}; {len(candidates)} file(s) inspected")
-    for path, reason in errors:
-        print(f"ERROR  {path}: {reason}")
+    for finding_number, _finding in enumerate(errors, start=1):
+        # Do not echo paths, matched values, or exception details. This command
+        # is commonly run in public CI, where logs remain visible after a fix.
+        print(f"ERROR  finding-{finding_number:03d}: release safety rule failed")
     for gate in gates:
         print(f"GATE   {gate}")
     if not errors:

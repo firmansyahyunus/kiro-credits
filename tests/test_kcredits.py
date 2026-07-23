@@ -25,6 +25,8 @@ class KcreditsTests(unittest.TestCase):
             "DATA_DIR": kcredits.DATA_DIR,
             "CSV_PATH": kcredits.CSV_PATH,
             "LEGACY_CSV_PATH": kcredits.LEGACY_CSV_PATH,
+            "MAX_MESSAGE_LINE_BYTES": kcredits.MAX_MESSAGE_LINE_BYTES,
+            "MAX_CLASSIC_ROWS": kcredits.MAX_CLASSIC_ROWS,
         }
 
     def tearDown(self):
@@ -66,14 +68,14 @@ class KcreditsTests(unittest.TestCase):
             kcredits.CSV_PATH = kcredits.DATA_DIR / "usage.csv"
             kcredits.CLASSIC_DB = Path(temp_dir) / "no-classic-store.sqlite3"
             turn = dict(next(kcredits.iter_v3_turns()))
-            turn["project"] = "=WEBSERVICE(\"https://example.invalid\")"
+            turn["project"] = "  =WEBSERVICE(\"https://example.invalid\")"
             turn["model"] = "model\x1b[31m"
 
             self.assertEqual(1, kcredits._append_rows([turn]))
 
             with kcredits.CSV_PATH.open("r", encoding="utf-8", newline="") as handle:
                 row = next(csv.DictReader(handle))
-            self.assertTrue(row["project"].startswith("'="))
+            self.assertTrue(row["project"].startswith("'  ="))
             self.assertNotIn("\x1b", row["model"])
             self.assertIn("\\x1b", row["model"])
 
@@ -87,6 +89,21 @@ class KcreditsTests(unittest.TestCase):
 
     def test_terminal_text_escapes_control_characters(self):
         self.assertEqual("safe\\x1b[31m", kcredits._display_text("safe\x1b[31m"))
+        self.assertEqual("safe\\u202efile", kcredits._display_text("safe\u202efile"))
+
+    def test_safe_share_report_redacts_project_paths(self):
+        self.use_v3_fixture()
+        kcredits.CLASSIC_DB = FIXTURES / "missing.sqlite3"
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            kcredits.cmd_report("all", as_json=True, redact_paths=True)
+
+        rendered = output.getvalue()
+        report = json.loads(rendered)
+        self.assertTrue(report["safe_share"])
+        self.assertEqual(["project-1"], list(report["by_project"]))
+        self.assertNotIn("C:\\work\\example-project", rendered)
 
     def test_migrate_does_not_overwrite_existing_archive(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -114,6 +131,87 @@ class KcreditsTests(unittest.TestCase):
             self.assertEqual(1, details["v3_session_count"])
             self.assertFalse(kcredits.DATA_DIR.exists())
 
+    def test_safe_share_doctor_redacts_local_paths(self):
+        self.use_v3_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            kcredits.DATA_DIR = Path(temp_dir) / "private"
+            kcredits.CSV_PATH = kcredits.DATA_DIR / "usage.csv"
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    0,
+                    kcredits.cmd_doctor(as_json=True, redact_paths=True),
+                )
+
+            rendered = output.getvalue()
+            details = json.loads(rendered)
+            self.assertTrue(details["safe_share"])
+            self.assertEqual("<KIRO_SESSIONS_DIR>", details["v3_sessions_dir"])
+            self.assertNotIn(temp_dir, rendered)
+            self.assertNotIn(str(FIXTURES), rendered)
+
+    def test_archive_rejects_git_repository_location(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "source"
+            (repo / ".git").mkdir(parents=True)
+            kcredits.DATA_DIR = repo / "archive"
+            kcredits.CSV_PATH = kcredits.DATA_DIR / "usage.csv"
+
+            with self.assertRaises(kcredits.ArchiveSafetyError):
+                kcredits._append_rows([])
+
+    def test_archive_rejects_symlink_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            link = root / "archive-link"
+            try:
+                link.symlink_to(target, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            kcredits.DATA_DIR = link
+            kcredits.CSV_PATH = link / "usage.csv"
+            with self.assertRaises(kcredits.ArchiveSafetyError):
+                kcredits._append_rows([])
+
+    def test_oversized_message_line_is_skipped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions = Path(temp_dir) / "sessions"
+            session = sessions / "workspace" / "session"
+            session.mkdir(parents=True)
+            (session / "session.json").write_text(
+                json.dumps(
+                    {
+                        "id": "session",
+                        "workspacePaths": ["C:\\work\\oversized"],
+                        "modelId": "model",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            oversized = {
+                "id": "oversized",
+                "timestamp": "2026-07-01T00:00:00Z",
+                "payload": {
+                    "type": "usage_summary",
+                    "padding": "x" * 512,
+                    "promptTurnSummaries": [
+                        {"unit": "credit", "usage": 99.0, "usedTools": []}
+                    ],
+                },
+            }
+            (session / "messages.jsonl").write_text(
+                json.dumps(oversized) + "\n",
+                encoding="utf-8",
+            )
+            kcredits.V3_SESSIONS_DIR = sessions
+            kcredits.CLASSIC_DB = Path(temp_dir) / "missing.sqlite3"
+            kcredits.MAX_MESSAGE_LINE_BYTES = 128
+
+            self.assertEqual([], list(kcredits.all_turns()))
+
     def test_classic_store_is_opened_read_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "data.sqlite3"
@@ -139,6 +237,41 @@ class KcreditsTests(unittest.TestCase):
             self.assertEqual(1, len(turns))
             self.assertEqual(3.75, turns[0]["credits"])
             self.assertEqual("classic-session#0", turns[0]["event_id"])
+
+    def test_classic_store_row_limit_warns_and_stops(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "data.sqlite3"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE conversations_v2 "
+                "(conversation_id TEXT, key TEXT, updated_at INTEGER, value TEXT)"
+            )
+            value = json.dumps(
+                {
+                    "user_turn_metadata": {
+                        "usage_info": [{"unit": "credit", "value": 1.0}]
+                    },
+                    "model_info": {"model_name": "classic-model"},
+                }
+            )
+            conn.executemany(
+                "INSERT INTO conversations_v2 VALUES (?, ?, ?, ?)",
+                [
+                    ("session-1", "C:\\work\\one", 1782864000000, value),
+                    ("session-2", "C:\\work\\two", 1782864000000, value),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            kcredits.CLASSIC_DB = db_path
+            kcredits.MAX_CLASSIC_ROWS = 1
+            errors = io.StringIO()
+
+            with contextlib.redirect_stderr(errors):
+                turns = list(kcredits.iter_classic_turns())
+
+            self.assertEqual(1, len(turns))
+            self.assertIn("report may be incomplete", errors.getvalue())
 
 
 if __name__ == "__main__":

@@ -45,10 +45,22 @@ The project must not:
 `report` and `doctor` are read-only. `snapshot`, `snapshot-all`, and
 `migrate-archive` write only under `~/.kcredits/` by default. A custom
 `KCREDITS_DATA_DIR` must remain private and outside a source repository.
-Archive updates use an advisory lock. New rows written to CSV are neutralized
-against spreadsheet formulas, and terminal output escapes control characters.
+Archive updates use an advisory lock. Archive directories inside Git
+repositories and archive paths using symlinks or Windows reparse points are
+refused. POSIX archive permissions fail closed if they cannot be restricted.
+New rows written to CSV are neutralized against spreadsheet formulas, and
+terminal output escapes ASCII and Unicode format controls.
 `migrate-archive` preserves legacy content byte-for-byte, so review an old CSV
 before opening it in spreadsheet software.
+
+Use `--safe-share` or `--redact-paths` before posting report or diagnostic
+output. Redaction reduces accidental disclosure but is not a substitute for
+reviewing the final text or screenshot.
+
+To limit denial-of-service risk from corrupt local stores, oversized metadata,
+JSONL lines, and SQLite values are ignored, classic SQLite row processing is
+capped, and report aggregation streams records instead of retaining every turn.
+If a safety cap is reached, treat the resulting report as incomplete.
 
 ## Sensitive local artifacts
 

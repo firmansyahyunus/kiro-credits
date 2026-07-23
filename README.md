@@ -87,6 +87,8 @@ kcredits report month
 kcredits report all
 kcredits report all --project example-project
 kcredits report month --json
+kcredits report month --json --safe-share
+kcredits doctor --safe-share
 
 # Optional private archive
 kcredits snapshot
@@ -96,6 +98,11 @@ kcredits migrate-archive
 
 When running directly from the source, replace `kcredits` with
 `python kcredits.py` on Windows or `python3 kcredits.py` on macOS/Linux.
+
+Use `--safe-share` (or `--redact-paths`) before copying report or doctor output
+into an issue, chat, screenshot, or log. It replaces local project and
+filesystem paths with synthetic labels. Ordinary reports intentionally show
+real local project paths.
 
 ## Example
 
