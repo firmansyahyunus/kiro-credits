@@ -1,0 +1,3 @@
+{"id":"event-001","timestamp":"2026-07-01T01:02:03Z","payload":{"type":"usage_summary","promptTurnSummaries":[{"unit":"credit","usage":1.25,"usedTools":["read","grep"]}]}}
+{"timestamp":"2026-07-01T01:03:03Z","payload":{"type":"usage_summary","promptTurnSummaries":[{"unit":"credit","usage":2.5,"usedTools":[]}]}}
+{"id":"event-ignored","timestamp":"2026-07-01T01:04:03Z","payload":{"type":"other_event"}}

@@ -1,0 +1,13 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "kcredits-log",
+      "trigger": "Stop",
+      "action": {
+        "type": "command",
+        "command": "python3 \"<INSTALL_DIR>/kcredits.py\" snapshot"
+      }
+    }
+  ]
+}

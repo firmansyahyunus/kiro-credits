@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiro-credits"
+version = "0.1.0"
+description = "Privacy-first local credit usage reports for Kiro CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = []
+keywords = ["kiro", "cli", "credits", "usage", "analytics"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/firmansyahyunus/kiro-credits"
+Repository = "https://github.com/firmansyahyunus/kiro-credits"
+Issues = "https://github.com/firmansyahyunus/kiro-credits/issues"
+
+[project.scripts]
+kcredits = "kcredits:main"
+
+[tool.setuptools]
+py-modules = ["kcredits"]

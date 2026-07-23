@@ -1,0 +1,24 @@
+# Local usage data and scheduler output; never publish user/project metadata.
+usage.csv
+usage.csv.lock
+scheduled.log
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+
+# Local planning and legacy documentation; canonical release docs are Markdown.
+PLAN.md
+README.txt
+
+# Python packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environments and editor files
+.venv/
+.idea/
+.vscode/

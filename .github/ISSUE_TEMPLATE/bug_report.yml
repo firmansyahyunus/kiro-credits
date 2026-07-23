@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible problem using sanitized, synthetic data.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not upload real Kiro session files, prompt content, usage archives,
+        account identifiers, credentials, or screenshots containing local paths.
+        Report security issues privately as described in SECURITY.md.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed private paths, prompts, credentials, and account data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Ubuntu or another Linux distribution
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12.10"
+    validations:
+      required: true
+
+  - type: input
+    id: kiro-version
+    attributes:
+      label: Kiro CLI version
+      placeholder: "Output of: kiro-cli --version"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe expected and actual behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Sanitized reproduction
+      description: Use synthetic fixture data or commands with generic paths.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Sanitized doctor output
+      description: Remove all local paths before pasting `kcredits doctor --json`.
+      render: json
