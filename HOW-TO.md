@@ -35,6 +35,17 @@ Produce structured JSON:
 kcredits report month --json
 ```
 
+Produce output that is safer to paste into an issue or chat:
+
+```text
+kcredits report month --json --safe-share
+kcredits doctor --safe-share
+```
+
+`--safe-share` and `--redact-paths` are aliases. They replace project and
+filesystem paths with synthetic labels while preserving counts and credit
+totals.
+
 Reports group usage by project, model, and day. Credit values come from Kiro's
 local usage records; `kcredits` does not estimate or convert them.
 
@@ -97,7 +108,9 @@ kcredits snapshot-all
 ```
 
 Never point this variable at a Git repository, shared folder, public cloud
-folder, or web-served directory.
+folder, or web-served directory. `kcredits` refuses Git worktrees, symlinks,
+and Windows reparse points for archive storage. On POSIX systems it also fails
+closed if private directory or file permissions cannot be applied.
 
 For an older installation that stored `usage.csv` beside the script:
 
@@ -143,13 +156,18 @@ report. Deduplication uses the usage event identifier.
 
 ## Safe diagnostics
 
-`kcredits doctor --json` contains local filesystem paths. Before posting it to
-a public issue:
+Ordinary `kcredits doctor --json` output contains local filesystem paths.
+Prefer this command before posting diagnostics:
 
-1. replace the home directory with `<HOME>`;
-2. replace all project names with synthetic names;
-3. remove account identifiers if a future Kiro format adds them; and
-4. never attach the underlying session or database files.
+```text
+kcredits doctor --json --safe-share
+```
+
+Then still verify the result before sharing:
+
+1. confirm that local paths were replaced;
+2. remove account identifiers if a future Kiro format adds them; and
+3. never attach the underlying session or database files.
 
 For suspected vulnerabilities, follow [SECURITY.md](SECURITY.md) and do not
 open a public issue.

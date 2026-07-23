@@ -8,6 +8,7 @@ body:
       value: |
         Do not upload real Kiro session files, prompt content, usage archives,
         account identifiers, credentials, or screenshots containing local paths.
+        Run `kcredits doctor --safe-share` and review the output before pasting it.
         Report security issues privately as described in SECURITY.md.
 
   - type: checkboxes

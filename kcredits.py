@@ -15,11 +15,12 @@ Data sources (auto-detected):
 
 Commands:
   kcredits [report] [today|week|month|all] [--project SUBSTR] [--json]
+           [--redact-paths|--safe-share]
   kcredits today
   kcredits snapshot         # append current-project turns to usage.csv (dedup)
   kcredits snapshot-all     # append all projects' turns to usage.csv (dedup)
   kcredits migrate-archive  # copy a legacy repo-local CSV to the private data dir
-  kcredits doctor           # show local prerequisite and data-path diagnostics
+  kcredits doctor [--safe-share]  # local prerequisite and data-path diagnostics
   kcredits help
 """
 
@@ -31,6 +32,8 @@ import shutil
 import hashlib
 import math
 import sqlite3
+import stat
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -46,6 +49,15 @@ CSV_FIELDS = ["timestamp_iso", "date", "project", "session_id",
 
 V3_SESSIONS_DIR = Path.home() / ".kiro" / "sessions"
 CLASSIC_DB = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Kiro-Cli" / "data.sqlite3"
+
+MAX_METADATA_BYTES = 8 * 1024 * 1024
+MAX_MESSAGE_LINE_BYTES = 8 * 1024 * 1024
+MAX_CLASSIC_VALUE_BYTES = 8 * 1024 * 1024
+MAX_CLASSIC_ROWS = 250_000
+
+
+class ArchiveSafetyError(OSError):
+    """Raised when an archive path cannot be used without following links."""
 
 
 # ----------------------------- helpers -------------------------------------
@@ -82,45 +94,155 @@ def _credit_value(value):
 
 
 def _display_text(value):
-    """Escape terminal control characters from locally sourced labels."""
+    """Escape terminal and Unicode format controls from locally sourced labels."""
     text = str(value or "")
-    return "".join(
-        ch if ord(ch) >= 32 and ord(ch) != 127 else f"\\x{ord(ch):02x}"
-        for ch in text
-    )
+    escaped = []
+    for ch in text:
+        codepoint = ord(ch)
+        if ch.isprintable() and not unicodedata.category(ch).startswith("C"):
+            escaped.append(ch)
+        elif codepoint <= 0xFF:
+            escaped.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(f"\\U{codepoint:08x}")
+    return "".join(escaped)
 
 
 def _csv_text(value):
     """Neutralize spreadsheet formulas and control characters in CSV cells."""
     text = _display_text(value)
-    if text.startswith(("=", "+", "-", "@")):
+    if text.lstrip().startswith(("=", "+", "-", "@")):
         return "'" + text
     return text
 
 
+def _is_link_or_reparse(path):
+    """Return True for symlinks and Windows reparse points."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _repository_ancestor(path):
+    """Return a containing Git worktree, if one exists."""
+    resolved = path.resolve(strict=False)
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 def _private_mkdir(path):
+    if _is_link_or_reparse(path):
+        raise ArchiveSafetyError("archive directory must not be a link or reparse point")
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ArchiveSafetyError("archive path is not a directory")
     if os.name != "nt":
-        try:
-            path.chmod(0o700)
-        except OSError:
-            pass
+        path.chmod(0o700)
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise ArchiveSafetyError("archive directory permissions are not private")
 
 
 def _private_file(path):
+    if _is_link_or_reparse(path):
+        raise ArchiveSafetyError("archive file must not be a link or reparse point")
     if os.name != "nt":
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
+        path.chmod(0o600)
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise ArchiveSafetyError("archive file permissions are not private")
+
+
+def _secure_open_flags(flags):
+    flags |= getattr(os, "O_NOINHERIT", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
+
+
+def _open_private_rw(path):
+    fd = os.open(path, _secure_open_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    try:
+        _private_file(path)
+        return os.fdopen(fd, "r+b")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_private_append_text(path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(path, _secure_open_flags(flags), 0o600)
+    try:
+        _private_file(path)
+        return os.fdopen(fd, "a", encoding="utf-8", newline="")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_private_exclusive_binary(path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, _secure_open_flags(flags), 0o600)
+    try:
+        _private_file(path)
+        return os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _ensure_archive_location():
+    repo = _repository_ancestor(DATA_DIR)
+    if repo is not None:
+        raise ArchiveSafetyError("archive directory must be outside a Git repository")
+    _private_mkdir(DATA_DIR)
+    for path in (CSV_PATH, CSV_PATH.with_name(CSV_PATH.name + ".lock")):
+        if _is_link_or_reparse(path):
+            raise ArchiveSafetyError("archive files must not be links or reparse points")
+
+
+def _bounded_text(path, limit):
+    """Read a UTF-8 text file only when it is within the configured limit."""
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _bounded_lines(path, limit):
+    """Yield decoded lines without allowing one line to consume unbounded memory."""
+    try:
+        handle = path.open("rb")
+    except OSError:
+        return
+    with handle:
+        while True:
+            raw = handle.readline(limit + 1)
+            if not raw:
+                return
+            if len(raw) > limit:
+                while raw and not raw.endswith(b"\n"):
+                    raw = handle.readline(limit + 1)
+                continue
+            yield raw.decode("utf-8", errors="ignore")
 
 
 @contextmanager
 def _archive_lock():
     """Serialize archive updates with a cross-platform advisory file lock."""
-    _private_mkdir(DATA_DIR)
+    _ensure_archive_location()
     lock_path = CSV_PATH.with_name(CSV_PATH.name + ".lock")
-    with lock_path.open("a+b") as lock_file:
+    with _open_private_rw(lock_path) as lock_file:
         lock_file.seek(0, os.SEEK_END)
         if lock_file.tell() == 0:
             lock_file.write(b"\0")
@@ -155,7 +277,8 @@ def iter_v3_turns():
     for session_json in V3_SESSIONS_DIR.glob("*/*/session.json"):
         sess_dir = session_json.parent
         try:
-            meta = json.loads(session_json.read_text(encoding="utf-8", errors="ignore"))
+            metadata_text = _bounded_text(session_json, MAX_METADATA_BYTES)
+            meta = json.loads(metadata_text) if metadata_text is not None else {}
         except Exception:
             meta = {}
         wps = meta.get("workspacePaths") or []
@@ -166,53 +289,48 @@ def iter_v3_turns():
         msgs = sess_dir / "messages.jsonl"
         if not msgs.exists():
             continue
-        try:
-            f = msgs.open("r", encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        with f:
-            for line in f:
-                line = line.strip()
-                if not line or "usage_summary" not in line:
+        for line in _bounded_lines(msgs, MAX_MESSAGE_LINE_BYTES):
+            line = line.strip()
+            if not line or "usage_summary" not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            p = o.get("payload") or {}
+            if p.get("type") != "usage_summary":
+                continue
+            summaries = p.get("promptTurnSummaries") or []
+            if not summaries:
+                continue
+            ts = o.get("timestamp")
+            dt = _parse_iso(ts)
+            base_id = o.get("id") or ""
+            # Kiro normally supplies an event id. If it does not, derive a
+            # stable local id so distinct no-id events cannot collapse into
+            # the same "#0" archive row.
+            if not base_id:
+                digest = hashlib.sha256(
+                    (session_id + "\0" + (ts or "") + "\0" + line).encode("utf-8")
+                ).hexdigest()[:32]
+                base_id = "synthetic-" + digest
+            for idx, s in enumerate(summaries):
+                if s.get("unit") != "credit":
                     continue
-                try:
-                    o = json.loads(line)
-                except Exception:
+                credits = _credit_value(s.get("usage"))
+                if credits is None:
                     continue
-                p = o.get("payload") or {}
-                if p.get("type") != "usage_summary":
-                    continue
-                summaries = p.get("promptTurnSummaries") or []
-                if not summaries:
-                    continue
-                ts = o.get("timestamp")
-                dt = _parse_iso(ts)
-                base_id = o.get("id") or ""
-                # Kiro normally supplies an event id. If it does not, derive a
-                # stable local id so distinct no-id events cannot collapse into
-                # the same "#0" archive row.
-                if not base_id:
-                    digest = hashlib.sha256(
-                        (session_id + "\0" + (ts or "") + "\0" + line).encode("utf-8")
-                    ).hexdigest()[:32]
-                    base_id = "synthetic-" + digest
-                for idx, s in enumerate(summaries):
-                    if s.get("unit") != "credit":
-                        continue
-                    credits = _credit_value(s.get("usage"))
-                    if credits is None:
-                        continue
-                    yield {
-                        "dt": dt,
-                        "timestamp_iso": ts or "",
-                        "project": project,
-                        "session_id": session_id,
-                        "event_id": f"{base_id}#{idx}",
-                        "credits": credits,
-                        "model": model,
-                        "tools_count": len(s.get("usedTools") or []),
-                        "source": "v3",
-                    }
+                yield {
+                    "dt": dt,
+                    "timestamp_iso": ts or "",
+                    "project": project,
+                    "session_id": session_id,
+                    "event_id": f"{base_id}#{idx}",
+                    "credits": credits,
+                    "model": model,
+                    "tools_count": len(s.get("usedTools") or []),
+                    "source": "v3",
+                }
 
 
 def iter_classic_turns():
@@ -224,12 +342,23 @@ def iter_classic_turns():
         conn.row_factory = sqlite3.Row
     except Exception:
         return
-    turns = []
     try:
         rows = conn.execute(
-            "SELECT conversation_id, key AS cwd, updated_at, value FROM conversations_v2"
-        ).fetchall()
-        for r in rows:
+            "SELECT conversation_id, key AS cwd, updated_at, value, "
+            "length(CAST(value AS BLOB)) AS value_bytes FROM conversations_v2 "
+            "LIMIT ?",
+            (MAX_CLASSIC_ROWS + 1,),
+        )
+        for row_number, r in enumerate(rows):
+            if row_number >= MAX_CLASSIC_ROWS:
+                print(
+                    "[kcredits] warning: classic store row limit reached; "
+                    "the report may be incomplete.",
+                    file=sys.stderr,
+                )
+                break
+            if (r["value_bytes"] or 0) > MAX_CLASSIC_VALUE_BYTES:
+                continue
             try:
                 data = json.loads(r["value"])
             except Exception:
@@ -253,7 +382,7 @@ def iter_classic_turns():
                 credits = _credit_value(u.get("value"))
                 if credits is None:
                     continue
-                turns.append({
+                yield {
                     "dt": dt,
                     "timestamp_iso": dt.isoformat() if dt else "",
                     "project": r["cwd"],
@@ -263,13 +392,11 @@ def iter_classic_turns():
                     "model": model,
                     "tools_count": 0,
                     "source": "classic",
-                })
+                }
     except Exception:
         return
     finally:
         conn.close()
-
-    yield from turns
 
 
 def all_turns():
@@ -306,14 +433,14 @@ def filtered_turns(period="all", project_substr=None):
 
 # ----------------------------- reporting -----------------------------------
 
-def cmd_report(period="all", project_substr=None, as_json=False):
-    turns = list(filtered_turns(period, project_substr))
-
+def cmd_report(period="all", project_substr=None, as_json=False, redact_paths=False):
     by_project = {}
     by_day = {}
     by_model = {}
+    total_turns = 0
     total_credits = 0.0
-    for t in turns:
+    for t in filtered_turns(period, project_substr):
+        total_turns += 1
         total_credits += t["credits"]
         # group by normalized path so the same project isn't split by drive-letter case
         key = _norm_path(t["project"])
@@ -329,14 +456,29 @@ def cmd_report(period="all", project_substr=None, as_json=False):
         mm["turns"] += 1
         mm["credits"] += t["credits"]
 
+    project_order = sorted(
+        by_project,
+        key=lambda key: (-by_project[key]["credits"], key),
+    )
+    redacted_names = {
+        key: f"project-{index}"
+        for index, key in enumerate(project_order, start=1)
+    }
+
     if as_json:
         out = {
             "period": period,
-            "project_filter": project_substr,
-            "total_turns": len(turns),
+            "project_filter": "<redacted>" if redact_paths and project_substr else project_substr,
+            "safe_share": redact_paths,
+            "total_turns": total_turns,
             "total_credits": round(total_credits, 4),
-            "by_project": {v["name"]: {"turns": v["turns"], "credits": round(v["credits"], 4)}
-                           for v in by_project.values()},
+            "by_project": {
+                (redacted_names[key] if redact_paths else by_project[key]["name"]): {
+                    "turns": by_project[key]["turns"],
+                    "credits": round(by_project[key]["credits"], 4),
+                }
+                for key in project_order
+            },
             "by_model": {k: {"turns": v["turns"], "credits": round(v["credits"], 4)}
                          for k, v in by_model.items()},
             "by_day": {k: {"turns": v["turns"], "credits": round(v["credits"], 4)}
@@ -349,21 +491,27 @@ def cmd_report(period="all", project_substr=None, as_json=False):
              "month": "last 30 days", "all": "all time"}.get(period, period)
     print()
     print(f"  Kiro Credits - {label}" +
-          (f"  (project ~ '{_display_text(project_substr)}')" if project_substr else ""))
+          (
+              "  (project filter redacted)"
+              if redact_paths and project_substr
+              else f"  (project ~ '{_display_text(project_substr)}')"
+              if project_substr
+              else ""
+          ))
     print("  " + "-" * 60)
-    if not turns:
+    if not total_turns:
         print("  No credit data found for this filter.")
         print()
         return
 
     print(f"  {'Project':<42}{'Turns':>7}{'Credits':>11}")
-    for proj in sorted(by_project, key=lambda k: -by_project[k]["credits"]):
+    for proj in project_order:
         v = by_project[proj]
-        display_name = _display_text(v["name"])
+        display_name = redacted_names[proj] if redact_paths else _display_text(v["name"])
         name = display_name if len(display_name) <= 40 else "..." + display_name[-37:]
         print(f"  {name:<42}{v['turns']:>7}{v['credits']:>11.2f}")
     print("  " + "-" * 60)
-    print(f"  {'TOTAL':<42}{len(turns):>7}{total_credits:>11.2f}")
+    print(f"  {'TOTAL':<42}{total_turns:>7}{total_credits:>11.2f}")
 
     # Models used (right under TOTAL)
     print()
@@ -371,6 +519,8 @@ def cmd_report(period="all", project_substr=None, as_json=False):
     for mdl in sorted(by_model, key=lambda k: -by_model[k]["credits"]):
         v = by_model[mdl]
         safe_model = _display_text(mdl)
+        if len(safe_model) > 64:
+            safe_model = safe_model[:61] + "..."
         print(f"    {safe_model:<24}{v['turns']:>4} turns   {v['credits']:>9.2f} credits")
 
     print()
@@ -386,49 +536,57 @@ def cmd_report(period="all", project_substr=None, as_json=False):
 def _load_existing_event_ids():
     ids = set()
     if CSV_PATH.exists():
-        try:
-            with CSV_PATH.open("r", encoding="utf-8", newline="") as f:
-                for row in csv.DictReader(f):
-                    ids.add(row.get("event_id", ""))
-        except Exception:
-            pass
+        if _is_link_or_reparse(CSV_PATH):
+            raise ArchiveSafetyError("archive CSV must not be a link or reparse point")
+        with CSV_PATH.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                ids.add(row.get("event_id", ""))
     return ids
 
 
 def _append_rows(turns):
     with _archive_lock():
         existing = _load_existing_event_ids()
-        new = [t for t in turns if t["event_id"] not in existing]
-        if not new:
-            return 0
-        write_header = not CSV_PATH.exists()
-        with CSV_PATH.open("a", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            if write_header:
-                w.writeheader()
-            for t in sorted(new, key=lambda x: x["timestamp_iso"]):
-                w.writerow({
+        handle = None
+        writer = None
+        appended = 0
+        try:
+            for t in turns:
+                event_id = t["event_id"]
+                if event_id in existing:
+                    continue
+                if handle is None:
+                    write_header = not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0
+                    handle = _open_private_append_text(CSV_PATH)
+                    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+                    if write_header:
+                        writer.writeheader()
+                writer.writerow({
                     "timestamp_iso": _csv_text(t["timestamp_iso"]),
                     "date": t["dt"].strftime("%Y-%m-%d") if t["dt"] else "",
                     "project": _csv_text(t["project"]),
                     "session_id": _csv_text(t["session_id"]),
-                    "event_id": _csv_text(t["event_id"]),
+                    "event_id": _csv_text(event_id),
                     "credits": f"{t['credits']:.6f}",
                     "model": _csv_text(t["model"]),
                     "tools_count": t["tools_count"],
                     "source": _csv_text(t["source"]),
                 })
-        _private_file(CSV_PATH)
-        return len(new)
+                existing.add(event_id)
+                appended += 1
+        finally:
+            if handle is not None:
+                handle.close()
+        return appended
 
 
 def cmd_snapshot(all_projects=False):
     if all_projects:
-        turns = list(all_turns())
+        turns = all_turns()
         scope = "all projects"
     else:
         cwd = _norm_path(os.getcwd())
-        turns = [t for t in all_turns() if _norm_path(t["project"]) == cwd]
+        turns = (t for t in all_turns() if _norm_path(t["project"]) == cwd)
         scope = f"project {os.getcwd()}"
     try:
         n = _append_rows(turns)
@@ -450,30 +608,49 @@ def cmd_migrate_legacy_archive():
     if CSV_PATH.exists():
         print(f"[kcredits] destination already exists; not overwriting {CSV_PATH}")
         return 1
-    _private_mkdir(DATA_DIR)
-    with _archive_lock():
-        if CSV_PATH.exists():
-            print(f"[kcredits] destination already exists; not overwriting {CSV_PATH}")
-            return 1
-        shutil.copy2(LEGACY_CSV_PATH, CSV_PATH)
-        _private_file(CSV_PATH)
+    if _is_link_or_reparse(LEGACY_CSV_PATH):
+        print("[kcredits] migration refused: legacy archive must not be a link.", file=sys.stderr)
+        return 1
+    try:
+        with _archive_lock():
+            if CSV_PATH.exists():
+                print(f"[kcredits] destination already exists; not overwriting {CSV_PATH}")
+                return 1
+            created = False
+            try:
+                with LEGACY_CSV_PATH.open("rb") as source:
+                    with _open_private_exclusive_binary(CSV_PATH) as destination:
+                        created = True
+                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+            except Exception:
+                if created:
+                    CSV_PATH.unlink(missing_ok=True)
+                raise
+    except OSError as error:
+        print(f"[kcredits] migration failed: {_display_text(error)}", file=sys.stderr)
+        return 1
     print(f"[kcredits] copied legacy archive to {CSV_PATH}")
     return 0
 
 
-def cmd_doctor(as_json=False):
+def cmd_doctor(as_json=False, redact_paths=False):
     """Show local prerequisites and data locations without modifying anything."""
-    sessions = list(V3_SESSIONS_DIR.glob("*/*/session.json")) if V3_SESSIONS_DIR.exists() else []
+    session_count = (
+        sum(1 for _ in V3_SESSIONS_DIR.glob("*/*/session.json"))
+        if V3_SESSIONS_DIR.exists()
+        else 0
+    )
     details = {
         "python": sys.version.split()[0],
-        "v3_sessions_dir": str(V3_SESSIONS_DIR),
+        "v3_sessions_dir": "<KIRO_SESSIONS_DIR>" if redact_paths else str(V3_SESSIONS_DIR),
         "v3_sessions_dir_exists": V3_SESSIONS_DIR.exists(),
-        "v3_session_count": len(sessions),
-        "classic_db": str(CLASSIC_DB),
+        "v3_session_count": session_count,
+        "classic_db": "<KIRO_CLASSIC_DB>" if redact_paths else str(CLASSIC_DB),
         "classic_db_exists": CLASSIC_DB.exists(),
-        "archive_dir": str(DATA_DIR),
-        "archive_csv": str(CSV_PATH),
+        "archive_dir": "<KCREDITS_ARCHIVE_DIR>" if redact_paths else str(DATA_DIR),
+        "archive_csv": "<KCREDITS_ARCHIVE_CSV>" if redact_paths else str(CSV_PATH),
         "archive_csv_exists": CSV_PATH.exists(),
+        "safe_share": redact_paths,
     }
     if as_json:
         print(json.dumps(details, indent=2))
@@ -503,6 +680,10 @@ def main(argv=None):
     as_json = "--json" in args
     if as_json:
         args.remove("--json")
+    redact_paths = "--redact-paths" in args or "--safe-share" in args
+    for flag in ("--redact-paths", "--safe-share"):
+        while flag in args:
+            args.remove(flag)
 
     project = None
     if "--project" in args:
@@ -527,22 +708,22 @@ def main(argv=None):
     if cmd == "migrate-archive":
         return cmd_migrate_legacy_archive()
     if cmd == "doctor":
-        return cmd_doctor(as_json)
+        return cmd_doctor(as_json, redact_paths)
     if cmd == "today":
-        cmd_report("today", project, as_json)
+        cmd_report("today", project, as_json, redact_paths)
         return 0
     if cmd == "report":
         period = args[1] if len(args) > 1 else "all"
         if period not in ("today", "week", "month", "all"):
-            print(f"Unknown period '{period}'. Use: today|week|month|all")
+            print(f"Unknown period '{_display_text(period)}'. Use: today|week|month|all")
             return 1
-        cmd_report(period, project, as_json)
+        cmd_report(period, project, as_json, redact_paths)
         return 0
     if cmd in ("today", "week", "month", "all"):
-        cmd_report(cmd, project, as_json)
+        cmd_report(cmd, project, as_json, redact_paths)
         return 0
 
-    print(f"Unknown command '{cmd}'. Try: kcredits help")
+    print(f"Unknown command '{_display_text(cmd)}'. Try: kcredits help")
     return 1
 
 

@@ -24,7 +24,13 @@ as the source of truth. Installer URLs and supported systems may change.
 Open PowerShell:
 
 ```powershell
-irm 'https://cli.kiro.dev/install.ps1' | iex
+$KiroInstaller = Join-Path $env:TEMP 'kiro-install.ps1'
+Invoke-WebRequest 'https://cli.kiro.dev/install.ps1' -OutFile $KiroInstaller
+Get-FileHash $KiroInstaller -Algorithm SHA256
+Get-Content $KiroInstaller
+# Continue only after confirming the URL and reviewing the downloaded script.
+& $KiroInstaller
+Remove-Item -LiteralPath $KiroInstaller
 kiro-cli --version
 kiro-cli doctor
 kiro-cli
@@ -35,7 +41,13 @@ kiro-cli
 Open Terminal:
 
 ```bash
-curl -fsSL https://cli.kiro.dev/install | bash
+kiro_installer="$(mktemp)"
+curl -fsSL https://cli.kiro.dev/install -o "$kiro_installer"
+shasum -a 256 "$kiro_installer"
+less "$kiro_installer"
+# Continue only after confirming the URL and reviewing the downloaded script.
+bash "$kiro_installer"
+rm -f "$kiro_installer"
 kiro-cli --version
 kiro-cli doctor
 kiro-cli
@@ -47,16 +59,23 @@ The official guide currently provides AppImage, ZIP, and Ubuntu `.deb` options.
 For Ubuntu:
 
 ```bash
-wget https://desktop-release.q.us-east-1.amazonaws.com/latest/kiro-cli.deb
-sudo dpkg -i kiro-cli.deb
-sudo apt-get install -f
+kiro_deb="$(mktemp --suffix=.deb)"
+wget -O "$kiro_deb" \
+  https://desktop-release.q.us-east-1.amazonaws.com/latest/kiro-cli.deb
+sha256sum "$kiro_deb"
+dpkg-deb --info "$kiro_deb"
+# Continue only after confirming the URL and package metadata.
+sudo apt install "$kiro_deb"
+rm -f "$kiro_deb"
 kiro-cli --version
 kiro-cli doctor
 kiro-cli
 ```
 
 Review the official guide for architecture and `glibc` requirements before
-using the ZIP or AppImage variants.
+using the ZIP or AppImage variants. A locally calculated hash records exactly
+what was installed; compare it with an official checksum whenever Kiro
+publishes one.
 
 ## 3. Install Python
 

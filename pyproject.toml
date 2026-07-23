@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiro-credits"
-version = "0.1.0"
+version = "0.1.1"
 description = "Privacy-first local credit usage reports for Kiro CLI"
 readme = "README.md"
 requires-python = ">=3.12"
